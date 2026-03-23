@@ -1,71 +1,114 @@
 'use strict';
 
-const { WorkloadModuleBase } = require('@hyperledger/caliper-core');
-const crypto = require('crypto');
-
 /**
- * ══════════════════════════════════════════════════════════════════════
- *  IssueCertificate Workload Module — BCMS Benchmark
- * ══════════════════════════════════════════════════════════════════════
- *  Function  : IssueCertificate(id, studentID, studentName, degree,
- *                               issuer, issueDate, certHash, signature)
- *  RBAC      : Org1MSP only (invokerIdentity: User1@org1.example.com)
- *  Guarantee : 0 failures — idempotent (duplicate IDs return nil)
- *  Crypto    : SHA-256 hash computed client-side matching chaincode logic
- * ══════════════════════════════════════════════════════════════════════
+ * ══════════════════════════════════════════════════════════════════════════════
+ *  issueCertificate.js  —  BCMS Caliper Workload Module
+ * ══════════════════════════════════════════════════════════════════════════════
+ *
+ *  Targets : IssueCertificateBatch(certsJSON string) → BatchResult
+ *  Contract: basic  (chaincode-bcms/hybrid-batch/smartcontract_hybrid.go)
+ *  Access  : Org1MSP (User1@org1.example.com)
+ *
+ *  BATCHING DESIGN
+ *  ───────────────
+ *  Standard model:   N certs  =  N blockchain transactions  =  N ordering cycles
+ *  Hybrid-Batch:     N certs  =  1 blockchain transaction   =  1 ordering cycle
+ *
+ *  With batchSize = 5 (default):
+ *    - Each Caliper "send" wraps 5 certificates into ONE Fabric Tx
+ *    - Orderer overhead reduced by 5×
+ *    - Effective certificate throughput ≈ TPS × batchSize
+ *    - World State PutState ops: still N (one per cert) — integrity unchanged
+ *
+ *  Parameter synchronisation with smartcontract_hybrid.go:
+ *    • contractFunction : 'IssueCertificateBatch'          ✓ matches Go func name
+ *    • contractArguments: [JSON.stringify(batch)]           ✓ matches (certsJSON string)
+ *    • readOnly         : false                             ✓ write operation
+ *    • JSON fields      : id, student_id, student_name,
+ *                         degree, issuer, issue_date        ✓ match Certificate struct tags
+ * ══════════════════════════════════════════════════════════════════════════════
  */
-class IssueCertificateWorkload extends WorkloadModuleBase {
+
+const { WorkloadModuleBase } = require('@hyperledger/caliper-core');
+
+class IssueCertificateBatchWorkload extends WorkloadModuleBase {
     constructor() {
         super();
-        this.txIndex = 0;
+        this.txIndex  = 0;
+        /**
+         * batchSize controls how many Certificate objects are included in
+         * each single Fabric transaction.  This is the core batching knob.
+         *
+         * Dissertation note:
+         *   batchSize = 1  →  baseline (equivalent to individual IssueCertificate)
+         *   batchSize = 5  →  5× reduction in consensus round-trips
+         *   batchSize = 10 →  10× reduction (but larger MVCC read-set per Tx)
+         */
+        this.batchSize = 5;
     }
 
-    async initializeWorkloadModule(workerIndex, totalWorkers, roundIndex, roundArguments, sutAdapter, sutContext) {
-        await super.initializeWorkloadModule(workerIndex, totalWorkers, roundIndex, roundArguments, sutAdapter, sutContext);
+    async initializeWorkloadModule(
+        workerIndex, totalWorkers, roundIndex, roundArguments, sutAdapter, sutContext
+    ) {
+        await super.initializeWorkloadModule(
+            workerIndex, totalWorkers, roundIndex, roundArguments, sutAdapter, sutContext
+        );
         this.txIndex = 0;
     }
 
     async submitTransaction() {
-        this.txIndex++;
+        const workerIdx = this.workerIndex || 0;
+        const batch     = [];
 
-        const workerIdx   = this.workerIndex || 0;
-        const certID      = `CERT_${workerIdx}_${this.txIndex}`;
-        const studentID   = `STU_${workerIdx}_${this.txIndex}`;
-        const studentName = `Student_${workerIdx}_${this.txIndex}`;
-        const degree      = 'Bachelor of Computer Science';
-        const issuer      = 'Digital University';
-        const issueDate   = new Date().toISOString().split('T')[0];
+        // ── Build the certificate batch ────────────────────────────────────────
+        for (let i = 0; i < this.batchSize; i++) {
+            this.txIndex++;
 
-        // SHA-256 H(C) = SHA256(studentID || studentName || degree || issuer || issueDate)
-        // Must match ComputeCertHash() in Go chaincode exactly
-        const fields   = [studentID, studentName, degree, issuer, issueDate].join('|');
-        const certHash = crypto.createHash('sha256').update(fields).digest('hex');
-        const signature = `SIG_${certID}_${certHash.substring(0, 16)}`;
+            // Unique IDs prevent duplicate-key errors on the ledger
+            const certID      = `CERT_W${workerIdx}_T${this.txIndex}_B${i}_${Date.now()}`;
+            const studentID   = `STU_W${workerIdx}_T${this.txIndex}_B${i}`;
+            const studentName = `Student_${workerIdx}_${this.txIndex}`;
 
+            // Fields MUST match Certificate struct JSON tags in smartcontract_hybrid.go:
+            //   id          → cert.ID
+            //   student_id  → cert.StudentID
+            //   student_name→ cert.StudentName
+            //   degree      → cert.Degree
+            //   issuer      → cert.Issuer
+            //   issue_date  → cert.IssueDate
+            batch.push({
+                id:           certID,
+                student_id:   studentID,
+                student_name: studentName,
+                degree:       'PhD in Computer Science',
+                issuer:       'Sana University',
+                issue_date:   new Date().toISOString().split('T')[0]
+                // NOTE: cert_hash, hash_algo, is_revoked, doc_type,
+                //       created_at, updated_at, tx_id are computed by chaincode
+            });
+        }
+
+        // ── Caliper request — aligned with IssueCertificateBatch signature ─────
+        // func (s *SmartContract) IssueCertificateBatch(
+        //     ctx contractapi.TransactionContextInterface,
+        //     certsJSON string,              ← contractArguments[0]
+        // ) (*BatchResult, error)
         const request = {
             contractId:        'basic',
-            contractFunction:  'IssueCertificate',
-            // Args must match Go func signature EXACTLY:
-            // (id, studentID, studentName, degree, issuer, issueDate, certHash, signature)
-            contractArguments: [
-                certID,
-                studentID,
-                studentName,
-                degree,
-                issuer,
-                issueDate,
-                certHash,
-                signature
-            ],
-            readOnly: false
+            contractFunction:  'IssueCertificateBatch',
+            contractArguments: [JSON.stringify(batch)],
+            readOnly:          false,
+            timeout:           120   // seconds — handles high-load orderer delays
         };
 
         return this.sutAdapter.sendRequests(request);
     }
 
     async cleanupWorkloadModule() {
-        // No cleanup needed — idempotent design
+        // No resources to release
     }
 }
 
-module.exports = { createWorkloadModule: () => new IssueCertificateWorkload() };
+module.exports = {
+    createWorkloadModule: () => new IssueCertificateBatchWorkload()
+};

@@ -4,12 +4,11 @@
   "description": "Hyperledger Caliper Benchmark — BCMS Certificate System",
   "private": true,
   "scripts": {
+    "benchmark": "caliper launch manager --caliper-workspace . --caliper-networkconfig networks/networkConfig.yaml --caliper-benchconfig benchmarks/benchConfig.yaml --caliper-flow-only-test",
     "generate-report": "node generate_custom_report.js"
   },
   "dependencies": {
-    "@grpc/grpc-js": "^1.10.3",
     "@hyperledger/caliper-cli": "0.6.0",
-    "@hyperledger/fabric-gateway": "^1.5.0",
     "fabric-network": "^2.2.19"
   }
 }
